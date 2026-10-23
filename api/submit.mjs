@@ -10,8 +10,58 @@ const GROUP_COUNTS = Object.freeze({
 const EXPECTED_IDS = Object.entries(GROUP_COUNTS).flatMap(([group, count]) =>
   Array.from({ length: count }, (_, index) => `${group}-${index + 1}`)
 );
-const QUESTIONNAIRE_VERSION = 'fit-choice-sport-v1';
-const CONSENT_VERSION = 'einwilligung-v1';
+const SECOND_SUBJECTS = Object.freeze(["Biologie", "Chemie", "Deutsch", "Englisch", "Erdkunde/Geographie", "Erziehungswissenschaft/Pädagogik", "Evangelische Religionslehre", "Französisch", "Geschichte", "Informatik", "Italienisch", "Katholische Religionslehre", "Kunst", "Latein", "Mathematik", "Musik", "Philosophie", "Physik", "Politik/Sozialwissenschaften", "Sachunterricht", "Spanisch", "Technik", "Türkisch", "Wirtschaft", "Anderes Unterrichtsfach", "Kein weiteres Fach"]);
+// V1 bleibt für im Browser noch geöffnete alte Fragebögen akzeptiert.
+// V2 ergänzt Studienmerkmale und einen klar getrennten explorativen Zusatzblock.
+const VERSION_1 = 'fit-choice-sport-v1';
+const VERSION_2 = 'fit-choice-sport-v2';
+const CONSENT_VERSIONS = Object.freeze({
+  [VERSION_1]: 'einwilligung-v1',
+  [VERSION_2]: 'einwilligung-v2'
+});
+const ADDITIONAL_IDS = Object.freeze([
+  'sport-1', 'sport-2', 'sport-3', 'sport-4', 'sport-5', 'absicht-1'
+]);
+const BACKGROUND_KEYS = Object.freeze([
+  'fachsemester', 'studienphase', 'geschlecht', 'zweitfach',
+  'lehramt', 'unterrichtserfahrung', 'trainererfahrung'
+]);
+const OPTIONS = Object.freeze({
+  studienphase: ['bachelor','master','staatsexamen','anderes'],
+  geschlecht: ['weiblich','maennlich','divers'],
+  lehramt: ['grundschule','hrsge','gymge','berufskolleg','sonderpaedagogik','anderes'],
+  unterrichtserfahrung: ['ja','nein'],
+  trainererfahrung: ['keine','unter_1_jahr','1_bis_3_jahre','mehr_als_3_jahre'],
+  zweitfach: SECOND_SUBJECTS
+});
+const SUBJECT_GROUPS = Object.freeze({
+  A: ['Erziehungswissenschaft/Pädagogik','Evangelische Religionslehre','Geschichte',
+      'Katholische Religionslehre','Philosophie','Politik/Sozialwissenschaften','Wirtschaft'],
+  B: ['Deutsch','Englisch','Französisch','Italienisch','Latein','Spanisch','Türkisch'],
+  C: ['Biologie','Chemie','Erdkunde/Geographie','Informatik','Mathematik','Physik',
+      'Sachunterricht','Technik'],
+  D: ['Kunst','Musik'],
+  E: ['Anderes Unterrichtsfach']
+});
+function subjectGroup(subject) {
+  if (!subject) return null;
+  if (subject === 'Kein weiteres Fach') return 'kein_zweitfach';
+  return Object.keys(SUBJECT_GROUPS).find(key => SUBJECT_GROUPS[key].includes(subject)) ?? null;
+}
+function validateAdditional(obj) {
+  const extra = obj.additionalAnswers;
+  const bg = obj.background;
+  if (!extra || typeof extra !== 'object' || Array.isArray(extra) ||
+      Object.keys(extra).length !== ADDITIONAL_IDS.length ||
+      !ADDITIONAL_IDS.every(id => Number.isInteger(extra[id]) && extra[id] >= 1 && extra[id] <= 7)) return false;
+  if (!bg || typeof bg !== 'object' || Array.isArray(bg) ||
+      Object.keys(bg).length !== BACKGROUND_KEYS.length ||
+      !BACKGROUND_KEYS.every(key => Object.hasOwn(bg, key))) return false;
+  if (bg.fachsemester !== null &&
+      !(Number.isInteger(bg.fachsemester) && bg.fachsemester >= 1 && bg.fachsemester <= 30)) return false;
+  return Object.entries(OPTIONS).every(([key, values]) => bg[key] === null || values.includes(bg[key]));
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function send(res, status, content) {
@@ -48,10 +98,14 @@ export default async function handler(req, res) {
     if (Buffer.byteLength(JSON.stringify(obj), 'utf8') > 12000) {
       return send(res, 413, { error: 'Anfrage zu groß.' });
     }
+    const version = obj.questionnaireVersion;
     if (!UUID_RE.test(obj.submissionId || '') ||
-        obj.questionnaireVersion !== QUESTIONNAIRE_VERSION ||
-        obj.consent?.given !== true || obj.consent?.version !== CONSENT_VERSION) {
+        !Object.hasOwn(CONSENT_VERSIONS, version) ||
+        obj.consent?.given !== true || obj.consent?.version !== CONSENT_VERSIONS[version]) {
       return send(res, 400, { error: 'Einwilligung oder Studienversion ungültig.' });
+    }
+    if (version === VERSION_2 && !validateAdditional(obj)) {
+      return send(res, 400, { error: 'Zusatzantworten oder Studienangaben sind ungültig.' });
     }
     const answers = obj.answers;
     if (!answers || typeof answers !== 'object' || Array.isArray(answers) ||
@@ -72,12 +126,19 @@ export default async function handler(req, res) {
     }
 
     const record = {
-      questionnaireVersion: QUESTIONNAIRE_VERSION,
+      questionnaireVersion: version,
       submissionId: obj.submissionId,
       receivedAt: new Date().toISOString(),
-      consent: { given: true, version: CONSENT_VERSION },
+      consent: { given: true, version: CONSENT_VERSIONS[version] },
       answers: Object.fromEntries(EXPECTED_IDS.map(id => [id, answers[id]]))
     };
+    // Die bisherigen 37 Antworten bleiben exakt im ursprünglichen Format.
+    // Zusätzliche Daten stehen ausschließlich in neuen Feldern (Version 2).
+    if (version === VERSION_2) {
+      record.background = Object.fromEntries(BACKGROUND_KEYS.map(key => [key, obj.background[key]]));
+      record.background.zweitfachGruppe = subjectGroup(obj.background.zweitfach);
+      record.additionalAnswers = Object.fromEntries(ADDITIONAL_IDS.map(id => [id, obj.additionalAnswers[id]]));
+    }
     // Nextcloud 29+ unterstützt den neuen öffentlichen WebDAV-Endpunkt.
     // Bei Problemen versuchen wir den von Sciebo dokumentierten älteren Endpunkt.
     // Zugangsdaten bleiben ausschließlich auf dem Vercel-Server.
