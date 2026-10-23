@@ -78,31 +78,66 @@ export default async function handler(req, res) {
       consent: { given: true, version: CONSENT_VERSION },
       answers: Object.fromEntries(EXPECTED_IDS.map(id => [id, answers[id]]))
     };
-    // Dokumentierter Sciebo-FileDrop: Token als WebDAV-Benutzername, Passwort separat.
-    const uploadUrl = new URL(`/public.php/webdav/${obj.submissionId}.json`, host.origin);
-    const credentials = Buffer.from(`${SCIEBO_TOKEN}:${SCIEBO_PASSWORD}`).toString('base64');
-    const upstream = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: {
-        Authorization: `Basic ${credentials}`,
-        'Content-Type': 'application/json; charset=utf-8',
-        'If-None-Match': '*'
-      },
-      body: JSON.stringify(record),
-      redirect: 'manual',
-      signal: AbortSignal.timeout(15000)
-    });
+    // Nextcloud 29+ unterstützt den neuen öffentlichen WebDAV-Endpunkt.
+    // Bei Problemen versuchen wir den von Sciebo dokumentierten älteren Endpunkt.
+    // Zugangsdaten bleiben ausschließlich auf dem Vercel-Server.
+    const filename = `${obj.submissionId}.json`;
+    const payload = JSON.stringify(record);
+    async function put(url, username, password) {
+      const credentials = Buffer.from(`${username}:${password}`).toString('base64');
+      return fetch(url, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'Content-Type': 'application/octet-stream',
+          'If-None-Match': '*'
+        },
+        body: payload,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(15000)
+      });
+    }
+
+    const modernUrl = new URL(
+      `/public.php/dav/files/${encodeURIComponent(SCIEBO_TOKEN)}/${filename}`,
+      host.origin
+    );
+    let upstream = await put(modernUrl, 'anonymous', SCIEBO_PASSWORD);
+    let endpoint = 'public-dav';
+    const modernStatus = upstream.status;
+
+    // 404/405: Endpunkt ist evtl. nicht freigeschaltet.
+    // 409: Konflikt beim Zugriff auf den Zielordner - älteren Pfad testen.
+    if ([404, 405, 409].includes(upstream.status)) {
+      const legacyUrl = new URL(`/public.php/webdav/${filename}`, host.origin);
+      upstream = await put(legacyUrl, SCIEBO_TOKEN, SCIEBO_PASSWORD);
+      endpoint = 'legacy-webdav';
+    }
 
     if (upstream.ok) {
       return send(res, 201, { success: true, submissionId: obj.submissionId });
     }
-    // Bei Verlust der ersten Antwort darf ein erneuter Klick keine zweite Datei erzeugen.
-    // Mit If-None-Match signalisiert 412, dass die Datei bereits vorhanden ist.
+    // Erneute Übertragung derselben ID kann bei If-None-Match mit 412 enden.
     if (upstream.status === 412) {
       return send(res, 200, { success: true, submissionId: obj.submissionId, alreadyExists: true });
     }
-    // Technische HTTP-Statuszahl (keine Inhalte oder personenbezogene Daten) für Fehlersuche.
-    console.error('Sciebo-Dateiupload fehlgeschlagen, Status:', upstream.status);
+
+    // Nur eine technisch relevante DAV-Fehlermeldung loggen; keine Rohantwort,
+    // URL, Zugangsdaten oder Fragebogenantworten in die Protokolle schreiben.
+    const davBody = (await upstream.text()).slice(0, 4000);
+    const messageMatch = davBody.match(/<(?:[A-Za-z0-9_-]+:)?message[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?message>/i);
+    const safeMessage = messageMatch?.[1]
+      ?.replaceAll(SCIEBO_TOKEN, '[TOKEN]')
+      ?.replaceAll(SCIEBO_PASSWORD, '[PASSWORT]')
+      ?.replace(/<[^>]*>/g, '')
+      ?.slice(0, 180);
+    console.error('Sciebo-Dateiupload fehlgeschlagen:', {
+      endpoint,
+      modernStatus,
+      status: upstream.status,
+      message: safeMessage || 'keine DAV-Fehlermeldung'
+    });
     return send(res, 502, { error: 'Sciebo hat die Speicherung nicht bestätigt.' });
   } catch (err) {
     console.error('Fehler beim Datei-Upload:', err?.name || 'unbekannt');
